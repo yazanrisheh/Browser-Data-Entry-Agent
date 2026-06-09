@@ -1,3 +1,4 @@
 VE_preAgent/
 .env
 auth.json
+tmp/

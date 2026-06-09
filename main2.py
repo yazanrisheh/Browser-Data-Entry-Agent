@@ -1,4 +1,4 @@
-from browser_use import Agent, Browser, BrowserProfile, ChatAnthropic
+from browser_use import Agent, Browser, BrowserProfile, ChatAnthropic, ChatOpenAI
 from dotenv import load_dotenv
 import asyncio
 import csv
@@ -30,6 +30,7 @@ SPEED_OPTIMIZATION_PROMPT = """
 Speed optimization instructions:
 - Be extremely concise and direct in your responses
 - Get to the goal as quickly as possible
+- Assume pages are ready as soon as key interactive elements are available
 - Use multi-action sequences whenever possible to reduce steps
 - Once you are done with entire process just say "I'm Done Yazan". No need to say anything else or any give any summary
 """
@@ -38,7 +39,8 @@ async def main():
     log_file = open(LOG_FILE, "a", encoding="utf-8")
     sys.stdout = Tee(log_file)
 
-    llm = ChatAnthropic(model="claude-sonnet-4-6")
+    claude_llm = ChatAnthropic(model="claude-sonnet-4-6")
+    openai_llm = ChatOpenAI(model = "gpt-5.4-mini")
     page_extraction_model = ChatAnthropic(model="claude-haiku-4-5-20251001")
 
     browser_profile_info = BrowserProfile(
@@ -89,7 +91,7 @@ Follow these steps to complete the process:
                 'x_pass': os.getenv("PASS"),
             },
             browser=browser,  # Reuse the same browser session
-            llm=llm,
+            llm=openai_llm,
             use_vision=True,
             vision_detail_level="auto",
             page_extraction_llm=page_extraction_model,
