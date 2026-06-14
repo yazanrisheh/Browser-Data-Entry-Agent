@@ -1,15 +1,27 @@
 from browser_use import Agent, Browser, BrowserProfile, ChatAnthropic, ChatOpenAI
 from dotenv import load_dotenv
+from pydantic import BaseModel
+from typing import Literal
 import asyncio
 import openpyxl
+import csv
 import time
 import os
 import sys
 from datetime import datetime
+from collections import defaultdict
 
 load_dotenv()
 
-LOG_FILE = "run_log_all.txt"
+os.makedirs("logs", exist_ok=True)
+TS = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+LOG_FILE = os.path.join("logs", TS + ".txt")
+FAIL_CSV = os.path.join("logs", f"missed_{TS}.csv")
+EXCEL_FILE = "Yazan Test.xlsx"
+PROGRESS_FILE = os.path.join("logs", f"progress_{os.path.basename(EXCEL_FILE)}.txt")
+COLUMNS = 3
+MAX_STEPS_PER_ENTRY = 25
+
 
 class Tee:
     def __init__(self, file):
@@ -24,60 +36,71 @@ class Tee:
         self.stdout.flush()
         self.file.flush()
 
-# EXCEL_FILE = "Timely Data - Yazan - Timely Data - Yazan.xlsx"
-EXCEL_FILE = "Yazan data.xlsx"
-ROWS = None  # Set to None to process all rows (one per date column with hours)
+
+class TaskStatus(BaseModel):
+    id: int                                         
+    tag: str                                        
+    hours: float                                    
+    status: Literal["logged", "skipped", "failed"] 
+    reason: str = ""                                
+
+
+
+class EntryResult(BaseModel):
+    tasks: list[TaskStatus]
+
+
+class TaskOutcome(BaseModel):
+    tag: str
+    hours: float
+    date: str
+    day: str
+    project: str
+    status: str     # "skipped" or "failed"
+    reason: str
+
 
 SPEED_OPTIMIZATION_PROMPT = """
 Speed optimization instructions:
-- Be extremely concise and direct in your responses
+- Be extremely concise and direct in your responses.
 - Get to the goal as quickly as possible.
-- Assume pages are ready as soon as key interactive elements are available
-- Use multi-action sequences whenever possible to reduce steps
-- Once you are done with entire process just say "I'm Done Yazan". No need to say anything else or any give any summary
+- Assume pages are ready as soon as key interactive elements are available.
+- Use multi-action sequences whenever possible to reduce steps.
+
+Chain-of-Draft reasoning (keep internal reasoning minimal):
+- In thinking, evaluation_previous_goal, and next_goal, write terse drafts, NOT sentences.
+- Limit each reasoning point to ~5 words. Notes, not prose. Drop articles and filler.
+- Record only the decisive signal: what changed, what's next. Do not restate page contents.
+- Example next_goal: "Click login; enter email" — NOT a full sentence.
+
+- Once you are done with the entire process just say "I'm Done Yazan". No summary, nothing else.
 """
 
-def load_excel_entries(path, max_entries=None):
-    """
-    Returns a list of dicts, one per (date_column, project) combination that has hours.
-    Each dict has: date, day, project, client, task_hours (formatted string), total_hours.
 
-    Excel layout:
-      Row 2: day names  (Mon, Tue, ...)  starting from col D (index 3)
-      Row 3: dates      (06/04, 07/04, ...) starting from col D
-      Row 4+: data rows with Client (col A), Project (col B), Hour Tags (col C), then hours per date column
-    """
+def load_excel_entries(path, columns=None):
+
     wb = openpyxl.load_workbook(path, data_only=True)
     ws = wb.active
 
-    # Read day and date headers from row 2 and row 3 (1-indexed in openpyxl)
-    # Data columns start at column index 4 (col D = index 4 in openpyxl, 1-based)
-    DATE_START_COL = 4  # col D
-
-    days = {}   # col_index -> day string e.g. "Monday"
-    dates = {}  # col_index -> date string e.g. "06/04/2026"
+    DATE_START_COL = 4
+    days = {}   
+    dates = {}  
 
     for col in ws.iter_cols(min_row=2, max_row=3, min_col=DATE_START_COL):
         col_idx = col[0].column
-        day_val = col[0].value   # row 2
-        date_val = col[1].value  # row 3
+        day_val = col[0].value   
+        date_val = col[1].value 
 
         if day_val is None and date_val is None:
             continue
 
-        # Normalise day
         day_str = str(day_val).strip() if day_val else ""
 
-        # Normalise date — could be a datetime object or a string like "06/04"
         if isinstance(date_val, datetime):
             date_str = date_val.strftime("%d/%m/%Y")
         elif date_val:
             raw = str(date_val).strip()
-            # If only DD/MM append current year
-            if raw.count("/") == 1:
-                date_str = raw + f"/{datetime.now().year}"
-            else:
-                date_str = raw
+            date_str = raw + f"/{datetime.now().year}" if raw.count("/") == 1 else raw
         else:
             date_str = ""
 
@@ -86,24 +109,23 @@ def load_excel_entries(path, max_entries=None):
 
     date_cols = sorted(dates.keys())
 
-    # Read data rows starting from row 4
-    # Group by date: for each date column collect all (project, tag, hours) entries
-    # Then build one task entry per (date, project) pair
-    from collections import defaultdict
+    if columns is None:
+        positions = range(1, len(date_cols) + 1)   
+    elif isinstance(columns, int):
+        positions = range(1, columns + 1)          
+    else:
+        positions = columns                         
+    selected_cols = [date_cols[p - 1] for p in positions if 1 <= p <= len(date_cols)]
+
     date_project_tasks = defaultdict(lambda: defaultdict(list))
-    # date_project_tasks[col_idx][project] = [(tag, hours), ...]
-    date_project_client = {}  # (col_idx, project) -> client
+    date_project_client = {}
 
     for row in ws.iter_rows(min_row=4, values_only=True):
-        client = row[0]   # col A
-        project = row[1]  # col B
-        tag = row[2]      # col C
-
+        client, project, tag = row[0], row[1], row[2]
         if project is None:
             continue
-
         for col_idx in date_cols:
-            hours_val = row[col_idx - 1]  # openpyxl row is 0-indexed tuple
+            hours_val = row[col_idx - 1]  
             if hours_val is None or hours_val == "" or hours_val == 0:
                 continue
             try:
@@ -114,31 +136,84 @@ def load_excel_entries(path, max_entries=None):
                 date_project_tasks[col_idx][str(project).strip()].append(
                     (str(tag).strip() if tag else "General", hours)
                 )
-                date_project_client[(col_idx, str(project).strip())] = str(client).strip() if client else ""
+                date_project_client[(col_idx, str(project).strip())] = (
+                    str(client).strip() if client else ""
+                )
 
-    # Flatten into task entries
     entries = []
-    for col_idx in date_cols:
+    for col_idx in selected_cols:
         for project, task_list in date_project_tasks[col_idx].items():
             total = sum(h for _, h in task_list)
-            # Build numbered task-hours string
-            task_lines = "\n".join(
-                f"{i + 1}) {tag}: {hours}h"
+
+            tasks = [
+                {"id": i + 1, "tag": tag, "hours": hours}
                 for i, (tag, hours) in enumerate(task_list)
-            )
+            ]
+            task_lines = "\n".join(f"{t['id']}) {t['tag']}: {t['hours']}h" for t in tasks)
+
             entries.append({
                 "date": dates[col_idx],
                 "day": days[col_idx],
                 "project": project,
                 "client": date_project_client.get((col_idx, project), ""),
-                "task_hours": task_lines,
+                "task_hours": task_lines,  
+                "tasks": tasks,            
                 "total_hours": total,
             })
 
-    if max_entries is not None:
-        entries = entries[:max_entries]
-
     return entries
+
+
+def entry_key(entry):
+    return f"{entry['date']}|{entry['project']}"
+
+
+def make_outcome(entry, item, status, reason):
+    return TaskOutcome(
+        tag=item["tag"], hours=item["hours"],
+        date=entry["date"], day=entry["day"], project=entry["project"],
+        status=status, reason=reason or "",
+    )
+
+
+def fail_all(entry, reason, status="failed"):
+    return [make_outcome(entry, it, status, reason) for it in entry["tasks"]]
+
+
+def reconcile(entry, reported_tasks):
+    """
+    Cross-checks the agent's reported task outcomes against the tasks we sent it.
+    Returns a list of failures (tasks that were skipped, failed, or silently omitted).
+
+    If the agent forgot to report a task, it's flagged as failed.
+    If the agent reported a task as skipped or failed, it's included as-is.
+    Only tasks reported as "logged" are considered successful and excluded.
+    """
+    
+    by_id = {t.id: t for t in (reported_tasks or [])}
+    failures = []
+    for it in entry["tasks"]:
+        rep = by_id.get(it["id"])
+        if rep is None:
+            # Agent never reported this task at all — treat as failure
+            failures.append(make_outcome(entry, it, "failed", "not reported by agent"))
+        elif rep.status != "logged":
+            # Agent reported it but it wasn't successfully logged
+            status = rep.status if rep.status in ("skipped", "failed") else "failed"
+            failures.append(make_outcome(entry, it, status, rep.reason or "no reason given"))
+    return failures
+
+
+def load_progress():
+    if not os.path.exists(PROGRESS_FILE):
+        return set()
+    with open(PROGRESS_FILE, encoding="utf-8") as f:
+        return {line.strip() for line in f if line.strip()}
+
+
+def mark_done(key):
+    with open(PROGRESS_FILE, "a", encoding="utf-8") as f:
+        f.write(key + "\n")
 
 
 async def main():
@@ -146,36 +221,67 @@ async def main():
     sys.stdout = Tee(log_file)
 
     claude_llm = ChatAnthropic(model="claude-sonnet-4-6")
-    openai_llm = ChatOpenAI(model="gpt-4o-mini")
+    openai_llm = ChatOpenAI(model="gpt-5.4-mini")
     page_extraction_model = ChatAnthropic(model="claude-haiku-4-5-20251001")
 
     browser_profile_info = BrowserProfile(
         minimum_wait_page_load_time=0.1,
         wait_between_actions=0.1,
-        headless=False,
+        headless=False, 
     )
 
+    
     browser = Browser(
-        keep_alive=True,
+        keep_alive=True, #only login once
         browser_profile=browser_profile_info,
         allowed_domains=["*.salesforce.com", "*.lightning.force.com"],
     )
     await browser.start()
 
-    entries = load_excel_entries(EXCEL_FILE, max_entries=ROWS)
-    print(f"Loaded {len(entries)} entries from {EXCEL_FILE}")
+    entries = load_excel_entries(EXCEL_FILE, columns=COLUMNS)
+    done = load_progress()  
+    print(f"Loaded {len(entries)} entries from {EXCEL_FILE} ({len(done)} already done, will skip)")
+
+    new_csv = not os.path.exists(FAIL_CSV)
+    fail_fp = open(FAIL_CSV, "a", newline="", encoding="utf-8")
+    fail_writer = csv.writer(fail_fp)
+    if new_csv:
+        fail_writer.writerow(["date", "day", "project", "tag", "hours", "status", "reason"])
+        fail_fp.flush()
+
+    def write_failure(t):
+        fail_writer.writerow([t.date, t.day, t.project, t.tag, t.hours, t.status, t.reason])
+        fail_fp.flush()
 
     overall_start = time.time()
     total_tokens_all = 0
     total_cost_all = 0.0
+    missed_entries = []
 
     for i, entry in enumerate(entries):
+        key = entry_key(entry)
+
+        if key in done:
+            print(f"\n--- Entry {i + 1}/{len(entries)}: SKIP (already done) {key} ---")
+            continue
+
         task = """
 Follow these steps to complete the process:
-1) Go to https://appliedai.lightning.force.com/lightning/n/preempt__My_Precursive. If you are NOT already logged in, log in with the details provided then click submit. If you are asked for authentication code then wait just 5 seconds as it will be written automatically. If already logged in, skip login entirely.
-2) In the middle of the page, you will see Date Navigation Control in the format format DD/MM/YYYY. Change the date to {date} also in format DD/MM/YYYY. If you are already on the same date then ignore this step.
-3) In the timesheet data entry grid, the project names are on the left side along with their tasks as rows whereas the dates are columns. Look for the project {project} and the correct day & date for {day} & {date} then write the correct hours for each task {task_hours} which are most of the time "0h". Press enter after writing the hour for each task
-4) Tasks do not need to have exact match. If they are logically similar then u can do the data entry for it otherwise ignore. Do not overthink and waste time on thinking twice. If its simply not logically same then do the next one.
+1) Go to https://appliedai.lightning.force.com/lightning/n/preempt__My_Precursive. If you are NOT already logged in, log in with the details provided then click submit. If you are asked for an authentication code then wait just 5 seconds as it will be written automatically. If already logged in, skip login entirely.
+2) In the middle of the page you will see a Date Navigation Control in the format DD/MM/YYYY. Change the date to {date} (also DD/MM/YYYY). If you are already on that date, ignore this step.
+3) In the timesheet data entry grid, projects are rows on the left with their tasks; dates are columns. Find project {project}, locate {day} ({date}), and enter the hours from the task list below (usually shown as "0h"). Press Enter after each entry. Scroll if not all tasks are visible.
+4) Tasks don't need to match exactly. If logically similar, enter them. If not, skip and move on.
+
+Task list:
+{task_hours}
+
+REPORTING (required): report the status of EVERY task above, one entry per task, using the task numbers exactly as listed. For each task return:
+- id: the task number (1, 2, 3, ...)
+- tag: the task name as given
+- hours: the hours value as given
+- status: "logged" if you successfully entered the hours, "skipped" if no matching row existed, "failed" if you tried but something went wrong
+- reason: brief explanation for skipped/failed (leave empty for logged)
+Do not omit any task. If you are unsure whether a task was logged, mark it "failed".
 """.format(
             date=entry["date"],
             day=entry["day"],
@@ -189,15 +295,12 @@ Follow these steps to complete the process:
 
         agent = Agent(
             task=task,
-            sensitive_data={
-                "x_user": os.getenv("EMAIL"),
-                "x_pass": os.getenv("PASS"),
-            },
+            sensitive_data={"x_user": os.getenv("EMAIL"), "x_pass": os.getenv("PASS")},
             browser=browser,
             llm=claude_llm,
-            use_vision=True,
+            use_vision=True,            
             vision_detail_level="auto",
-            page_extraction_llm=page_extraction_model,
+            page_extraction_llm=page_extraction_model, 
             use_thinking=False,
             flash_mode=True,
             extend_system_message=SPEED_OPTIMIZATION_PROMPT,
@@ -205,18 +308,43 @@ Follow these steps to complete the process:
             directly_open_url=True,
             calculate_cost=True,
             generate_gif=False,
-            max_failures=5,
-            max_actions_per_step=5,
+            max_failures=3,             
+            max_actions_per_step=5,     # actions per step
+            output_model_schema=EntryResult, 
         )
 
-        run = await agent.run()
+        try:
+            run = await agent.run(max_steps=MAX_STEPS_PER_ENTRY)
+            result = run.structured_output
 
-        print("Output: ", run.final_result())
+            if result is None:
+                # flag everything as failed if no agent finished but no structred doutput
+                entry_failures = fail_all(entry, "agent returned no structured output")
+            else:
+                # Cross-check what the agent reported against what we sent it
+                entry_failures = reconcile(entry, result.tasks)
+        except Exception as e:
+            # Agent threw an exception: flag all tasks and keep going
+            entry_failures = fail_all(entry, f"agent crashed: {e}")
+
+        try:
+            s = await agent.token_cost_service.get_usage_summary()
+            total_tokens_all += s.total_tokens
+            total_cost_all += s.total_cost
+            tok, cost = s.total_tokens, s.total_cost
+        except Exception:
+            tok, cost = 0, 0.0
+
+        for t in entry_failures:
+            print(f"  [{t.status.upper()}] {t.tag}: {t.hours}h | {t.reason}")
+            missed_entries.append(t)
+            write_failure(t)
+
+        if not entry_failures:
+            mark_done(key)
+
         row_elapsed = time.time() - row_start
-        s = await agent.token_cost_service.get_usage_summary()
-        total_tokens_all += s.total_tokens
-        total_cost_all += s.total_cost
-        print(f"Entry {i + 1} completed in {row_elapsed:.1f}s | tokens: {s.total_tokens:,} | cost: ${s.total_cost:.4f}")
+        print(f"Entry {i + 1} completed in {row_elapsed:.1f}s | failures: {len(entry_failures)} | tokens: {tok:,} | cost: ${cost:.4f}")
 
     overall_elapsed = time.time() - overall_start
     print(f"\n--- Overall ---")
@@ -225,9 +353,18 @@ Follow these steps to complete the process:
     print(f"Total tokens      : {total_tokens_all:,}")
     print(f"Total cost        : ${total_cost_all:.4f}")
 
+    if missed_entries:
+        print(f"\n--- Skipped/Failed Tasks ({len(missed_entries)}) — full list in {FAIL_CSV} ---")
+        for t in missed_entries:
+            print(f"  [{t.status.upper()}] {t.day} {t.date} | {t.project} | {t.tag}: {t.hours}h | {t.reason}")
+    else:
+        print("\nAll tasks logged successfully!")
+
+    fail_fp.close()
     await browser.kill()
     sys.stdout = sys.__stdout__
     log_file.close()
+
 
 if __name__ == "__main__":
     asyncio.run(main())

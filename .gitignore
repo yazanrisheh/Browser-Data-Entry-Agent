@@ -2,4 +2,5 @@ VE_preAgent/
 .env
 auth.json
 tmp/
+logs/
 ~$Yazan data.xlsx
