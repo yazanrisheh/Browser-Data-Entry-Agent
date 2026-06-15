@@ -243,6 +243,7 @@ async def run_entries(
             minimum_wait_page_load_time=0.1,
             wait_between_actions=0.1,
             headless=headless,
+            is_local=False
         ),
         allowed_domains=["*.salesforce.com", "*.lightning.force.com"],
     )
