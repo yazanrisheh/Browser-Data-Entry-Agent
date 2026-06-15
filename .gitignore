@@ -4,3 +4,5 @@ auth.json
 tmp/
 logs/
 ~$Yazan data.xlsx
+
+__pycache__/
