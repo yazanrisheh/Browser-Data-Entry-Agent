@@ -2,20 +2,22 @@
 
 Run locally with:   streamlit run app.py
 
-This is the "for now" single-user local version: the agent runs inside the
-button click via asyncio.run, and the failures table updates live as it goes.
-For a deployed multi-user version you'd move the run to a background worker
-and have the page poll a database instead (see notes in chat).
+Single-user local version: the agent runs inside the button click via
+asyncio.run. The sidebar shows a bounded, progressively-updating view of the
+plan, and the expander streams the agent's live thinking (browser-use logs).
+The browser opens visibly so you can complete the 2FA prompt yourself.
 """
 
 import sys
+import time
 import asyncio
 import tempfile
+from collections import deque
 
 import pandas as pd
 import streamlit as st
 
-from agent_core import run_entries
+from agent_core import run_entries, build_plan
 
 
 # --- silence the benign Windows asyncio "closed pipe" shutdown noise ---
@@ -29,9 +31,10 @@ def _ignore_closed_pipe(unraisable):
 sys.unraisablehook = _ignore_closed_pipe
 
 
-st.set_page_config(page_title="Precursive Data Entry Agent", page_icon="🗓️", layout="wide")
-st.title("🗓️ Precursive Data Entry Agent")
+st.set_page_config(page_title="Precursive Data Entry Agent", page_icon="📅", layout="wide")
+st.title("📅 Precursive Data Entry Agent")
 st.caption("Upload your timesheet, enter your Precursive login, and let the agent fill it in. "
+           "Keep the browser window on so you can enter the 2FA code. "
            "Anything it can't log is flagged below and downloadable as a CSV.")
 
 # ---------------- inputs ----------------
@@ -70,6 +73,52 @@ run_btn = st.button("Run data entry", type="primary")
 
 st.divider()
 
+
+# ---------------- sidebar plan rendering (bounded window) ----------------
+def render_sidebar(box, plan, entry_state):
+    """Draw a SHORT, progressively-updating view: counts, empty days,
+    recently done, the entry running now, and the next few up. Bounded even
+    for thousands of entries."""
+    entries = plan["entries"]
+    total = len(entries)
+    done_count = sum(1 for s in entry_state.values() if s.startswith("done"))
+
+    with box.container():
+        st.header("📋 Plan")
+        st.markdown(f"**Progress:** {done_count} / {total} entries done")
+
+        if plan["skipped_empty"]:
+            st.markdown("**Skipped — empty days**")
+            for d in plan["skipped_empty"]:
+                st.markdown(f"- ~~{d['day']} {d['date']}~~ · no hours")
+
+        st.divider()
+
+        # last few completed
+        done_entries = [e for e in entries
+                        if entry_state.get(e["index"], "pending").startswith("done")]
+        for e in done_entries[-3:]:
+            icon = "⚠️" if entry_state.get(e["index"]) == "done_issues" else "✅"
+            st.markdown(f"{icon} {e['day']} {e['date']} — {e['project']}")
+
+        # currently running (with its tasks)
+        cur = next((e for e in entries if entry_state.get(e["index"]) == "running"), None)
+        if cur is not None:
+            st.markdown(f"**⏳ Now: {cur['day']} {cur['date']} — {cur['project']}**")
+            for t in cur["tasks"]:
+                st.caption(f"• {t['tag']} ({t['hours']}h)")
+
+        # up next
+        pending = [e for e in entries
+                   if entry_state.get(e["index"], "pending") == "pending"]
+        if pending:
+            st.markdown("**Up next**")
+            for e in pending[:5]:
+                st.markdown(f"⬜ {e['day']} {e['date']} — {e['project']}")
+            if len(pending) > 5:
+                st.caption(f"…and {len(pending) - 5} more")
+
+
 # ---------------- run ----------------
 if run_btn:
     if not email or not password:
@@ -82,27 +131,64 @@ if run_btn:
         st.warning("Please enter valid column positions.")
         st.stop()
 
-    # Save the uploaded file to a temp path for openpyxl to read.
     suffix = ".xlsm" if uploaded.name.lower().endswith(".xlsm") else ".xlsx"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp.write(uploaded.getbuffer())
         excel_path = tmp.name
 
+    try:
+        plan = build_plan(excel_path, columns=columns_arg)
+    except Exception as e:
+        st.error(f"Couldn't read that Excel file: {e}")
+        st.stop()
+
+    entry_state = {e["index"]: "pending" for e in plan["entries"]}
+
+    sidebar_box = st.sidebar.empty()
+    render_sidebar(sidebar_box, plan, entry_state)
+
     status_box = st.empty()
     progress_bar = st.progress(0.0)
     table_box = st.empty()
+    agent_expander = st.expander("🔍 Agent thinking (live)", expanded=False)
+    agent_log_box = agent_expander.empty()
 
-    def progress_cb(done, total, failures, tokens, cost, label):
-        progress_bar.progress(done / total if total else 0.0)
+    # --- live agent-thinking stream (throttled so chatty logs don't thrash) ---
+    log_lines = deque(maxlen=500)
+    last_log_paint = {"t": 0.0}
+
+    def log_cb(line):
+        log_lines.append(line)
+        now = time.time()
+        if now - last_log_paint["t"] > 0.25:
+            last_log_paint["t"] = now
+            agent_log_box.code("\n".join(log_lines))
+
+    def progress_cb(ev):
+        idx = ev.get("index")
+        phase = ev.get("phase")
+        if phase == "start":
+            entry_state[idx] = "running"
+        elif phase == "done":
+            entry_state[idx] = "done_issues" if ev.get("had_failures") else "done_ok"
+        elif phase == "skip":
+            entry_state[idx] = "done_ok"
+
+        render_sidebar(sidebar_box, plan, entry_state)
+
+        done_count = sum(1 for s in entry_state.values() if s.startswith("done"))
+        total = ev.get("total", 0)
+        progress_bar.progress(done_count / total if total else 0.0)
         status_box.info(
-            f"Processed {done}/{total} — {label}  |  tokens: {tokens:,}  |  cost: ${cost:.4f}"
+            f"Processed {done_count}/{total} — {ev.get('label', '')}  |  "
+            f"tokens: {ev['tokens']:,}  |  cost: ${ev['cost']:.4f}"
         )
-        if failures:
-            table_box.dataframe(pd.DataFrame(failures), use_container_width=True)
+        if ev["failures"]:
+            table_box.dataframe(pd.DataFrame(ev["failures"]), use_container_width=True)
         else:
             table_box.success("No failures so far ✅")
 
-    status_box.info("Starting… the browser is launching and logging in.")
+    status_box.info("Starting… the browser is launching and logging in (watch for the 2FA prompt).")
     try:
         result = asyncio.run(run_entries(
             excel_path=excel_path,
@@ -111,10 +197,14 @@ if run_btn:
             password=password,
             headless=not show_browser,
             progress_cb=progress_cb,
+            log_cb=log_cb,
         ))
     except Exception as e:
         st.error(f"The run stopped unexpectedly: {e}")
         st.stop()
+
+    # flush any remaining buffered log lines
+    agent_log_box.code("\n".join(log_lines))
 
     # ---------------- summary ----------------
     progress_bar.progress(1.0)

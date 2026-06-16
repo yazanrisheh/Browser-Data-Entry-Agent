@@ -1,12 +1,13 @@
 """Core logic for the Precursive data-entry agent.
 
-Refactored from the standalone script so a UI (Streamlit) can drive it:
-- credentials, the Excel path, and the column selection are passed in as arguments
-- progress is reported through an optional callback instead of printing
-- no module-level file side effects (each run owns its own log files)
+Drives from a UI (Streamlit):
+- credentials, Excel path, and column selection are passed in as arguments
+- progress is reported through an event callback (a dict per step)
+- build_plan() exposes exactly what the agent will receive, so the UI can
+  show the full plan and which days are empty BEFORE anything runs
 
-Behaviour is otherwise identical to the original: same task accounting,
-reconcile(), fail_all(), resume-via-progress-file, and incremental CSV writing.
+Behaviour of the actual data entry is unchanged: same task accounting,
+reconcile(), fail_all(), resume-via-progress-file, incremental CSV writing.
 """
 
 from browser_use import Agent, Browser, BrowserProfile, ChatAnthropic
@@ -16,6 +17,7 @@ from typing import Literal, Callable, Optional
 import openpyxl
 import csv
 import os
+import logging
 from datetime import datetime
 from collections import defaultdict
 
@@ -68,7 +70,7 @@ Follow these steps to complete the process:
 1) Go to https://appliedai.lightning.force.com/lightning/n/preempt__My_Precursive. If you are NOT already logged in, log in with the details provided then click submit. If you are asked for an authentication code then wait just 5 seconds as it will be written automatically. If already logged in, skip login entirely.
 2) In the middle of the page you will see a Date Navigation Control in the format DD/MM/YYYY. Change the date to {date} (also DD/MM/YYYY). If you are already on that date, ignore this step.
 3) In the timesheet data entry grid, projects are rows on the left with their tasks; dates are columns. Find project {project}, locate {day} ({date}), and enter the hours from the task list below (usually shown as "0h"). Press Enter after each entry. Scroll if not all tasks are visible.
-4) Tasks don't need to match exactly. If logically similar, enter them. If not, skip and move on.
+4) Tasks don't need to match exactly. If logically similar, enter them. If not, skip and move on. If a certain project doesnt exist skip and move on, do not create it.
 
 Task list:
 {task_hours}
@@ -83,8 +85,60 @@ Do not omit any task. If you are unsure whether a task was logged, mark it "fail
 """
 
 
-# ---------------- excel parsing ----------------
-def load_excel_entries(path, columns=None):
+
+# ---------------- live log capture (agent thinking -> UI) ----------------
+class _UICallbackHandler(logging.Handler):
+    """Forwards every browser-use log line to a UI callback so the agent's
+    step-by-step thinking can be streamed into the Streamlit expander."""
+    def __init__(self, cb):
+        super().__init__()
+        self.cb = cb
+
+    def emit(self, record):
+        try:
+            self.cb(self.format(record))
+        except Exception:
+            pass
+
+
+def _attach_log_handler(log_cb):
+    """Attach our handler broadly so we catch browser-use's loggers regardless
+    of how they're named. Returns (handler, loggers) so we can detach later."""
+    handler = _UICallbackHandler(log_cb)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    handler.setLevel(logging.INFO)
+    targets = {logging.getLogger(), logging.getLogger("browser_use")}
+    for name in list(logging.root.manager.loggerDict.keys()):
+        root_name = name.split(".")[0]
+        if root_name in ("browser_use", "Agent", "tools", "prompts", "cdp_use", "bubus"):
+            targets.add(logging.getLogger(name))
+    for lg in targets:
+        if lg.level == logging.NOTSET or lg.level > logging.INFO:
+            lg.setLevel(logging.INFO)
+        lg.addHandler(handler)
+    return handler, targets
+
+
+def _detach_log_handler(handler, loggers):
+    for lg in loggers:
+        try:
+            lg.removeHandler(handler)
+        except Exception:
+            pass
+
+
+# ---------------- excel parsing / planning ----------------
+def build_plan(path, columns=None):
+    """Parse the Excel into the work plan.
+
+    Returns:
+      {
+        "entries": [ {date, day, project, tasks[], task_hours, total_hours, index}, ... ],
+        "skipped_empty": [ {date, day}, ... ],   # selected dates with zero hours
+        "selected_dates": [ {date, day}, ... ],  # all selected date columns, in order
+      }
+    One entry = one project on one date (with at least one task that has hours).
+    """
     wb = openpyxl.load_workbook(path, data_only=True)
     ws = wb.active
 
@@ -143,8 +197,18 @@ def load_excel_entries(path, columns=None):
                 )
 
     entries = []
+    skipped_empty = []
+
     for col_idx in selected_cols:
-        for project, task_list in date_project_tasks[col_idx].items():
+        projects = date_project_tasks.get(col_idx, {})
+        has_any = any(task_list for task_list in projects.values())
+        if not has_any:
+            # Whole day has no hours -- record it and skip (no agent run wasted).
+            skipped_empty.append({"date": dates[col_idx], "day": days[col_idx]})
+            continue
+        for project, task_list in projects.items():
+            if not task_list:
+                continue
             total = sum(h for _, h in task_list)
             tasks = [
                 {"id": i + 1, "tag": tag, "hours": hours}
@@ -161,7 +225,14 @@ def load_excel_entries(path, columns=None):
                 "total_hours": total,
             })
 
-    return entries
+    for k, e in enumerate(entries):
+        e["index"] = k  # flat position, used by the UI to highlight the current entry
+
+    return {
+        "entries": entries,
+        "skipped_empty": skipped_empty,
+        "selected_dates": [{"date": dates[c], "day": days[c]} for c in selected_cols],
+    }
 
 
 # ---------------- helpers ----------------
@@ -216,16 +287,19 @@ async def run_entries(
     headless: bool = False,
     logs_dir: str = "logs",
     progress_cb: Optional[Callable] = None,
+    log_cb: Optional[Callable] = None,
 ):
-    """Process the selected columns. Calls progress_cb after each entry with:
-       (done_count, total, failures_list_of_dicts, total_tokens, total_cost, label).
+    """Process the selected columns. progress_cb receives a dict event per step:
+       {phase, index, total, label, failures, tokens, cost, had_failures}
+    Raw agent thinking is streamed separately via log_cb(line).
     Returns a summary dict including the CSV path and the full failures list."""
     os.makedirs(logs_dir, exist_ok=True)
     ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     fail_csv = os.path.join(logs_dir, f"missed_{ts}.csv")
     progress_file = os.path.join(logs_dir, f"progress_{os.path.basename(excel_path)}.txt")
 
-    entries = load_excel_entries(excel_path, columns=columns)
+    plan = build_plan(excel_path, columns=columns)
+    entries = plan["entries"]
     done = load_progress(progress_file)
     total = len(entries)
 
@@ -243,28 +317,46 @@ async def run_entries(
             minimum_wait_page_load_time=0.1,
             wait_between_actions=0.1,
             headless=headless,
-            is_local=False
         ),
         allowed_domains=["*.salesforce.com", "*.lightning.force.com"],
     )
     await browser.start()
 
-    all_failures = []      # list of dicts, for the UI table + return value
+    log_handler = log_targets = None
+    if log_cb is not None:
+        log_handler, log_targets = _attach_log_handler(log_cb)
+
+    all_failures = []   # list of dicts for the UI table + return value
     total_tokens = 0
     total_cost = 0.0
 
-    def emit(done_count, label):
+    def emit(**kw):
         if progress_cb:
-            progress_cb(done_count, total, list(all_failures), total_tokens, total_cost, label)
+            ev = {
+                "total": total,
+                "failures": list(all_failures),
+                "tokens": total_tokens,
+                "cost": total_cost,
+            }
+            ev.update(kw)
+            progress_cb(ev)
 
     try:
-        for i, entry in enumerate(entries):
+        for entry in entries:
+            i = entry["index"]
             key = entry_key(entry)
             label = f"{entry['day']} {entry['date']} | {entry['project']}"
 
-            if key in done:
-                emit(i + 1, f"Skipped (already done): {label}")
+            # Defensive: never call the agent for an entry with no tasks.
+            if not entry["tasks"]:
+                emit(phase="skip", index=i, label=label)
                 continue
+
+            if key in done:
+                emit(phase="skip", index=i, label=label)
+                continue
+
+            emit(phase="start", index=i, label=label)
 
             task = TASK_TEMPLATE.format(
                 date=entry["date"], day=entry["day"],
@@ -316,8 +408,10 @@ async def run_entries(
             if not entry_failures:
                 mark_done(progress_file, key)
 
-            emit(i + 1, label)
+            emit(phase="done", index=i, label=label, had_failures=bool(entry_failures))
     finally:
+        if log_handler is not None:
+            _detach_log_handler(log_handler, log_targets)
         fail_fp.close()
         await browser.kill()
 
